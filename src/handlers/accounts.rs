@@ -3,7 +3,9 @@ use glob_match::glob_match;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use uuid::Uuid;
-use worker::{query, D1PreparedStatement, Env};
+use worker::{D1PreparedStatement, Env};
+
+use crate::d1_query;
 
 use super::{get_batch_size, server_password_iterations, two_factor_enabled};
 use crate::{
@@ -272,7 +274,7 @@ pub async fn register(
         updated_at: now,
     };
 
-    query!(
+    d1_query!(
         &db,
         "INSERT INTO users (id, name, email, master_password_hash, master_password_hint, password_salt, password_iterations, key, private_key, public_key, kdf_type, kdf_iterations, kdf_memory, kdf_parallelism, security_stamp, equivalent_domains, excluded_globals, totp_recover, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
@@ -393,7 +395,7 @@ pub async fn revision_date(
     Ok(Json(revision_date))
 }
 
-/// GET /api/accounts/tasks
+/// GET /api/tasks
 ///
 /// Vaultwarden returns an empty list here; some official clients call this endpoint.
 /// We don't implement task workflows, so always return an empty list.
@@ -455,7 +457,7 @@ pub async fn post_profile(
     user.name = Some(payload.name);
     user.updated_at = now.clone();
 
-    query!(
+    d1_query!(
         &db,
         "UPDATE users SET name = ?1, updated_at = ?2 WHERE id = ?3",
         user.name,
@@ -522,7 +524,7 @@ pub async fn put_avatar(
     user.avatar_color = payload.avatar_color;
     user.updated_at = now.clone();
 
-    query!(
+    d1_query!(
         &db,
         "UPDATE users SET avatar_color = ?1, updated_at = ?2 WHERE id = ?3",
         user.avatar_color,
@@ -589,19 +591,19 @@ pub async fn delete_account(
     sends::delete_user_sends(&db, env.as_ref(), user_id).await?;
 
     // Delete all user's ciphers
-    query!(&db, "DELETE FROM ciphers WHERE user_id = ?1", user_id)
+    d1_query!(&db, "DELETE FROM ciphers WHERE user_id = ?1", user_id)
         .map_err(|_| AppError::Database)?
         .run()
         .await?;
 
     // Delete all user's folders
-    query!(&db, "DELETE FROM folders WHERE user_id = ?1", user_id)
+    d1_query!(&db, "DELETE FROM folders WHERE user_id = ?1", user_id)
         .map_err(|_| AppError::Database)?
         .run()
         .await?;
 
     // Delete the user
-    query!(&db, "DELETE FROM users WHERE id = ?1", user_id)
+    d1_query!(&db, "DELETE FROM users WHERE id = ?1", user_id)
         .map_err(|_| AppError::Database)?
         .run()
         .await?;
@@ -653,7 +655,7 @@ pub async fn post_password(
     let now = db::now_string();
 
     // Update user record
-    query!(
+    d1_query!(
         &db,
         "UPDATE users SET master_password_hash = ?1, password_salt = ?2, password_iterations = ?3, key = ?4, master_password_hint = ?5, security_stamp = ?6, updated_at = ?7 WHERE id = ?8",
         new_hashed_password,
@@ -723,7 +725,7 @@ pub async fn post_rotatekey(
     let personal_ciphers: Vec<_> = payload
         .account_data
         .ciphers
-        .iter()
+        .into_iter()
         .filter(|c| c.organization_id.is_none())
         .collect();
 
@@ -836,7 +838,7 @@ pub async fn post_rotatekey(
         let Some(folder_id) = &folder.id else {
             continue;
         };
-        let stmt = query!(
+        let stmt = d1_query!(
             &db,
             "UPDATE folders SET name = ?1, updated_at = ?2 WHERE id = ?3 AND user_id = ?4",
             folder.name,
@@ -858,15 +860,11 @@ pub async fn post_rotatekey(
         // id is guaranteed to exist (validated above)
         let cipher_id = cipher.id.as_ref().unwrap();
 
-        let cipher_data = CipherData {
-            name: cipher.name.clone(),
-            notes: cipher.notes.clone(),
-            type_fields: cipher.type_fields.clone(),
-        };
+        let cipher_data = CipherData::new(cipher.name, cipher.notes, cipher.type_fields);
 
         let data = serde_json::to_string(&cipher_data).map_err(|_| AppError::Internal)?;
 
-        let stmt = query!(
+        let stmt = d1_query!(
             &db,
             "UPDATE ciphers SET data = ?1, folder_id = ?2, favorite = ?3, updated_at = ?4 WHERE id = ?5 AND user_id = ?6",
             data,
@@ -883,7 +881,7 @@ pub async fn post_rotatekey(
         // The Bitwarden clients send `attachments2` only during key rotation.
         if let Some(attachments2) = &cipher.attachments2 {
             for (attachment_id, attachment) in attachments2 {
-                let stmt = query!(
+                let stmt = d1_query!(
                     &db,
                     "UPDATE attachments SET file_name = ?1, akey = ?2, updated_at = ?3 WHERE id = ?4 AND cipher_id = ?5",
                     attachment.file_name,
@@ -932,7 +930,7 @@ pub async fn post_rotatekey(
     };
 
     // Update user record with new keys and password
-    query!(
+    d1_query!(
         &db,
         "UPDATE users SET master_password_hash = ?1, password_salt = ?2, password_iterations = ?3, key = ?4, private_key = ?5, kdf_type = ?6, kdf_iterations = ?7, kdf_memory = ?8, kdf_parallelism = ?9, security_stamp = ?10, updated_at = ?11 WHERE id = ?12",
         new_hashed_password,
@@ -958,19 +956,6 @@ pub async fn post_rotatekey(
 }
 
 /// POST /accounts/kdf - Change KDF settings (PBKDF2 <-> Argon2id)
-///
-/// API Format History:
-/// - Bitwarden switched to complex format in v2025.10.0
-/// - Vaultwarden followed in PR #6458, WITHOUT backward compatibility
-/// - We implement backward compatibility to support both formats
-///
-/// Supports two request formats:
-///
-/// 1. Simple/Legacy format (Bitwarden < v2025.10.0, e.g. web vault 2025.07):
-/// { "kdf": 0, "kdfIterations": 650000, "key": "...", "masterPasswordHash": "...", "newMasterPasswordHash": "..." }
-///
-/// 2. Complex format (Bitwarden >= v2025.10.0, e.g. official client 2025.11.x):
-/// { "authenticationData": {...}, "unlockData": {...}, "key": "...", "masterPasswordHash": "...", "newMasterPasswordHash": "..." }
 #[worker::send]
 pub async fn post_kdf(
     claims: Claims,
@@ -999,43 +984,38 @@ pub async fn post_kdf(
         return Err(AppError::Unauthorized("Invalid password".to_string()));
     }
 
-    // Additional validation for complex format
-    if let (Some(ref auth_data), Some(ref unlock_data)) =
-        (&payload.authentication_data, &payload.unlock_data)
-    {
-        // KDF settings must match between authentication and unlock
-        if auth_data.kdf != unlock_data.kdf {
-            return Err(AppError::BadRequest(
-                "KDF settings must be equal for authentication and unlock".to_string(),
-            ));
-        }
-        // Salt (email) must match
-        if user.email != auth_data.salt || user.email != unlock_data.salt {
-            return Err(AppError::BadRequest(
-                "Invalid master password salt".to_string(),
-            ));
-        }
+    let auth_data = &payload.authentication_data;
+    let unlock_data = &payload.unlock_data;
+
+    if auth_data.kdf != unlock_data.kdf {
+        return Err(AppError::BadRequest(
+            "KDF settings must be equal for authentication and unlock".to_string(),
+        ));
     }
 
-    // Extract KDF parameters from either format
-    let (kdf_type, kdf_iterations, kdf_memory, kdf_parallelism) = payload
-        .get_kdf_params()
-        .ok_or_else(|| AppError::BadRequest("Missing KDF parameters".to_string()))?;
+    if user.email != auth_data.salt || user.email != unlock_data.salt {
+        return Err(AppError::BadRequest(
+            "Invalid master password salt".to_string(),
+        ));
+    }
 
-    // Validate new KDF parameters
+    let kdf_type = unlock_data.kdf.kdf;
+    let kdf_iterations = unlock_data.kdf.kdf_iterations;
+    let kdf_memory = unlock_data.kdf.kdf_memory;
+    let kdf_parallelism = unlock_data.kdf.kdf_parallelism;
+
     ensure_supported_kdf(kdf_type, kdf_iterations, kdf_memory, kdf_parallelism)?;
 
     // Generate new salt and hash the new password
     let new_salt = generate_salt()?;
     let password_iterations = server_password_iterations(&env) as i32;
     let new_hashed_password = hash_password_for_storage(
-        payload.get_new_password_hash(),
+        &auth_data.master_password_authentication_hash,
         &new_salt,
         password_iterations as u32,
     )
     .await?;
 
-    // Generate new security stamp
     let new_security_stamp = Uuid::new_v4().to_string();
     let now = db::now_string();
 
@@ -1047,17 +1027,13 @@ pub async fn post_kdf(
         (None, None)
     };
 
-    // Get the new encrypted user key
-    let new_key = payload.get_new_key();
-
-    // Update user record with new KDF settings and password
-    query!(
+    d1_query!(
         &db,
         "UPDATE users SET master_password_hash = ?1, password_salt = ?2, password_iterations = ?3, key = ?4, kdf_type = ?5, kdf_iterations = ?6, kdf_memory = ?7, kdf_parallelism = ?8, security_stamp = ?9, updated_at = ?10 WHERE id = ?11",
         new_hashed_password,
         new_salt,
         password_iterations,
-        new_key,
+        &unlock_data.master_key_wrapped_user_key,
         kdf_type,
         kdf_iterations,
         final_kdf_memory,
@@ -1113,7 +1089,7 @@ pub async fn post_sstamp(
     let new_security_stamp = Uuid::new_v4().to_string();
     let now = db::now_string();
 
-    query!(
+    d1_query!(
         &db,
         "UPDATE users SET security_stamp = ?1, updated_at = ?2 WHERE id = ?3",
         new_security_stamp,
