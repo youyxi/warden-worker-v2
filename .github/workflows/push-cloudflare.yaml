@@ -28,9 +28,9 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Set up Node.js (for npx wrangler)
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
         with:
-          node-version: "20"
+          node-version: "24"
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
         run: |
@@ -240,10 +240,10 @@ jobs:
             bash scripts/seed-global-domains.sh --db vault1 --remote --wrangler-version "${WRANGLER_VERSION}"
           fi
 
-      - uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65 # v3
+      - uses: cloudflare/wrangler-action@v4 # v4
         id: cf
         with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          api-token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           wranglerVersion: ${{ env.WRANGLER_VERSION }}
           packageManager: npm
